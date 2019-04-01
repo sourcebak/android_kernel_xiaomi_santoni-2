@@ -27,24 +27,31 @@ static struct delayed_work charger_limiter_work;
 static struct workqueue_struct *charge_limiter_wq;
 static bool charging_off = false;
 static bool cl_is_enabled = false;
+static bool charge_should_off = false;
 
 /* Tunables */
 static int enabled = 0;
 static int charging_below = 95;
 static int charging_limit = 100;
 
-static void enable_charging(void)
+static void reschedule_worker(int ms)
 {
-	struct power_supply *batt_psy = power_supply_get_by_name("battery");
+	queue_delayed_work(charge_limiter_wq,
+		&charger_limiter_work, msecs_to_jiffies(ms));
+}
+
+static void enable_disable_charging(struct power_supply *batt_psy, bool enable)
+{
 	int rc = 0;
 
-	if (!batt_psy)
-		return;
-
-	if (charging_off) {
+	if (charging_off && enable) {
 		rc = power_supply_set_charging_enabled(batt_psy, 1);
 		if (!rc)
 			charging_off = false;
+	} else if (!charging_off && !enable) {
+		rc = power_supply_set_charging_enabled(batt_psy, 0);
+		if (!rc)
+			charging_off = true;
 	}
 }
 
@@ -53,34 +60,37 @@ static void charger_limiter_worker(struct work_struct *work)
 	struct power_supply *batt_psy = power_supply_get_by_name("battery");
 	struct power_supply *usb_psy = power_supply_get_by_name("usb");
 	union power_supply_propval status, bat_percent, usb_connect = {0,};
-	int rc = 0;
+	int rc = 0, ms_timer = 1000;
 
-	if (!batt_psy->get_property || !usb_psy->get_property)
-		queue_delayed_work(charge_limiter_wq,
-				&charger_limiter_work, msecs_to_jiffies(5000));
+	if (!batt_psy->get_property || !usb_psy->get_property) {
+		ms_timer = 5000;
+		goto reschedule;
+	}
 
 	batt_psy->get_property(batt_psy, POWER_SUPPLY_PROP_STATUS, &status);
 	batt_psy->get_property(batt_psy, POWER_SUPPLY_PROP_CAPACITY, &bat_percent);
 	usb_psy->get_property(usb_psy, POWER_SUPPLY_PROP_PRESENT, &usb_connect);
 
 	if (bat_percent.intval <= charging_below)
-		enable_charging();
+		enable_disable_charging(batt_psy, true);
 
 	if (status.intval == POWER_SUPPLY_STATUS_CHARGING || usb_connect.intval) {
 		if (bat_percent.intval <= charging_below) {
-			enable_charging();
+			enable_disable_charging(batt_psy, true);
 		} else if (bat_percent.intval >= charging_limit) {
-			if (!charging_off) {
-				rc = power_supply_set_charging_enabled(batt_psy, 0);
-				if (!rc)
-					charging_off = true;
+			if (charge_should_off) {
+				enable_disable_charging(batt_psy, false);
+				charge_should_off = false;
+			} else {
+				charge_should_off = true;
+				// atleast 10 seconds
+				ms_timer = 10000;
 			}
 		}
 	}
 
-	// rescheduler worker atleast after 1s
-	queue_delayed_work(charge_limiter_wq,
-			&charger_limiter_work, msecs_to_jiffies(1000));
+reschedule:
+	reschedule_worker(ms_timer);
 }
 
 static int start_charger_limiter(void)
@@ -90,17 +100,20 @@ static int start_charger_limiter(void)
 		return -ENOMEM;
 
 	INIT_DELAYED_WORK(&charger_limiter_work, charger_limiter_worker);
-	queue_delayed_work(charge_limiter_wq,
-			&charger_limiter_work, msecs_to_jiffies(1000));
+	reschedule_worker(1000);
 
 	return 0;
 }
 
 static void stop_charger_limiter(void)
 {
+	struct power_supply *batt_psy = power_supply_get_by_name("battery");
+
 	cancel_delayed_work_sync(&charger_limiter_work);
 	destroy_workqueue(charge_limiter_wq);
-	enable_charging();
+
+	if (batt_psy)
+		enable_disable_charging(batt_psy, true);
 }
 
 /******************************************************************/
